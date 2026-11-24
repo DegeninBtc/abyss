@@ -1,0 +1,1028 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>ABYSS // 無限巨構深淵</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+  canvas{display:block;width:100vw;height:100vh;cursor:crosshair}
+  #hud{position:fixed;left:10px;top:9px;font:11px/1.45 "JetBrains Mono","SFMono-Regular",Consolas,Menlo,monospace;color:#8fd8e6;
+       letter-spacing:.06em;text-shadow:0 0 6px rgba(80,200,230,.35);pointer-events:none;opacity:.82}
+  #hud .r{display:flex;gap:10px}
+  #hud b{font-weight:400;color:#ffb35c}
+  #hud button{pointer-events:auto;font:inherit;color:#8fd8e6;background:rgba(8,18,24,.55);border:1px solid rgba(120,210,230,.35);
+       padding:1px 7px;margin:4px 6px 0 0;cursor:pointer;letter-spacing:.06em}
+  #hud button:hover{border-color:#ffb35c;color:#ffb35c}
+  #joy{position:fixed;width:84px;height:84px;margin:-42px 0 0 -42px;border:1px solid rgba(140,220,235,.35);border-radius:50%;display:none;pointer-events:none}
+  #joy i{position:absolute;left:32px;top:32px;width:20px;height:20px;border-radius:50%;background:rgba(140,220,235,.35)}
+  #err{position:fixed;inset:0;display:none;color:#f96;font:12px monospace;white-space:pre-wrap;padding:20px;background:#000c;overflow:auto}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div class="r"><span>DEPTH <b id="hDep">0000.0</b> m</span></div>
+  <div class="r"><span>RAD&nbsp;&nbsp; <b id="hRad">0.000</b> mSv/h</span></div>
+  <div><button id="bPause">❚❚ PAUSE</button><button id="bPal">PAL·ABYSS</button></div>
+</div>
+<div id="joy"><i></i></div>
+<div id="err"></div>
+
+<script id="vs" type="x-shader/x-vertex">#version 300 es
+void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2); gl_Position = vec4(p*2.0-1.0, 0.0, 1.0); }
+</script>
+
+<!-- ================= SCENE : SDF + RAYMARCH ================= -->
+<script id="fsCommon" type="x-shader/x-fragment">
+precision highp float;
+precision highp int;
+uniform float uTime;
+#define PI  3.14159265
+#define TAU 6.28318531
+const float CELL = 200.0;   // horizontal repetition of shaft cells
+const float RW   = 70.0;    // shaft wall radius
+
+float gMat, gCyan, gAmber, gPix;
+
+mat2 rot(float a){ float c=cos(a), s=sin(a); return mat2(c,s,-s,c); }
+float sdBox(vec3 p, vec3 b){ vec3 q=abs(p)-b; return length(max(q,0.0))+min(max(q.x,max(q.y,q.z)),0.0); }
+float sdBox2(vec2 p, vec2 b){ vec2 q=abs(p)-b; return length(max(q,0.0))+min(max(q.x,q.y),0.0); }
+float sdSeg(vec2 p, vec2 a, vec2 b){ vec2 pa=p-a, ba=b-a; float h=clamp(dot(pa,ba)/dot(ba,ba),0.0,1.0); return length(pa-ba*h); }
+float sdCap(vec3 p, vec3 a, vec3 b, float r){ vec3 pa=p-a, ba=b-a; float h=clamp(dot(pa,ba)/dot(ba,ba),0.0,1.0); return length(pa-ba*h)-r; }
+// 2D box with 45deg chamfered corners
+float chamf2(vec2 p, vec2 b, float c){ return max(sdBox2(p,b), (abs(p.x)+abs(p.y)-b.x-b.y+c)*0.70710678); }
+float chamf3(vec3 p, vec3 b, float c){
+  vec3 a=abs(p); float e=max(max(a.x+a.y-b.x-b.y, a.y+a.z-b.y-b.z), a.z+a.x-b.z-b.x)+c;
+  return max(sdBox(p,b), e*0.70710678);
+}
+float sdTrap(vec2 p, float r1, float r2, float he){
+  vec2 k1=vec2(r2,he), k2=vec2(r2-r1,2.0*he);
+  p.x=abs(p.x);
+  vec2 ca=vec2(p.x-min(p.x,(p.y<0.0)?r1:r2), abs(p.y)-he);
+  vec2 cb=p-k1+k2*clamp(dot(k1-p,k2)/dot(k2,k2),0.0,1.0);
+  float s=(cb.x<0.0 && ca.y<0.0)?-1.0:1.0;
+  return s*sqrt(min(dot(ca,ca),dot(cb,cb)));
+}
+// polar fold: returns (tangential u, radial w)
+vec2 pmod(vec2 xz, float n, out float idx){
+  float sa=TAU/n; float a=atan(xz.y,xz.x); idx=floor(a/sa+0.5); float al=a-idx*sa; float r=length(xz);
+  return vec2(r*sin(al), r*cos(al));
+}
+// infinite Menger sponge (KIFS box-fold lattice). negative = solid
+float sponge(vec3 p){
+  float d=-1e5, s=1.0;
+  for(int m=0;m<3;m++){
+    vec3 a=mod(p*s,2.0)-1.0; s*=3.0;
+    vec3 r=abs(1.0-3.0*abs(a));
+    float c=(min(max(r.x,r.y),min(max(r.y,r.z),max(r.z,r.x)))-1.0)/s;
+    d=max(d,c);
+  }
+  return d;
+}
+float sst(float a,float b,float x){ float t=clamp((x-a)/(b-a),0.0,1.0); return t*t*(3.0-2.0*t); }
+void U(inout float d, float nd, float m){ if(nd<d){ d=nd; gMat=m; } }
+
+float cabinY(){ return -45.0 + 60.0*sin(0.15*(uTime-25.0)); }
+float pistonExt(float k){ float f=0.55+0.45*fract(k*0.618+0.31); return 1.6+1.35*sin(uTime*f + k*1.9); }
+
+// ---------------- 50 m ring forge ----------------
+void forge(vec3 p, inout float d){
+  float rr=length(p.xz);
+  float bound=max(rr-33.2, abs(p.y+1.5)-14.6);
+  if(bound>d) return;
+  float i40; vec2 s40=pmod(p.xz,40.0,i40);
+  // armoured housing ring
+  float hous=sdBox2(vec2(rr-25.0,p.y), vec2(3.4,3.9))-0.4;
+  hous=max(hous, -sdBox2(vec2(rr-21.2,p.y+0.2), vec2(0.7,1.5)));         // forge-mouth groove
+  hous=max(hous, -sdBox2(vec2(rr-28.85,abs(p.y)-1.9), vec2(0.12,0.05)));  // panel seam
+  U(d,hous,1.0);
+  float band=sdBox2(vec2(rr-25.0,abs(p.y)-4.25), vec2(4.3,0.2))-0.05;   // flanges
+  U(d,band,2.0);
+  float rib=chamf3(vec3(s40.x,p.y,s40.y-29.05), vec3(0.3,4.6,0.75), 0.2);
+  float tooth=chamf3(vec3(s40.x,p.y-2.7,s40.y-21.45), vec3(0.22,0.8,0.5), 0.12);
+  U(d,min(rib,tooth),1.0);
+  float glow=sdBox2(vec2(rr-21.75,p.y+0.2), vec2(0.15,1.2));
+  gAmber=min(gAmber,glow); U(d,glow,4.0);
+  // crucible basin + underside ribs
+  vec2 bq=vec2(rr,p.y+7.5);
+  float basin=sdTrap(bq,8.0,22.5,3.6);
+  float bribs=max(abs(s40.x)-0.22, sdTrap(bq,8.7,23.3,3.9));
+  float spout=max(rr-3.0, abs(p.y+13.2)-2.4);
+  spout=min(spout, max(rr-3.8, abs(abs(p.y+13.2)-1.6)-0.25));
+  U(d,min(min(basin,bribs),spout),1.0);
+  // molten pool
+  float pool=max(rr-21.2, abs(p.y+3.75)-0.2);
+  gAmber=min(gAmber,pool); U(d,pool,4.0);
+  // slowly rotating vanes
+  vec2 bxz=rot(uTime*0.21)*p.xz;
+  float ib; vec2 bs=pmod(bxz,14.0,ib);
+  vec3 bl=vec3(bs.x, p.y+0.6, bs.y-13.2);
+  bl.xy=rot(0.65)*bl.xy;
+  float blade=sdBox(bl, vec3(0.16,1.7,7.9))-0.04;
+  U(d,blade,11.0);
+  float hub=max(rr-4.6, abs(p.y-1.5)-2.5);
+  hub=min(hub, max(rr-5.1, abs(abs(p.y-1.5)-1.6)-0.28));
+  hub=min(hub, max(rr-1.4, abs(p.y-6.0)-2.6));
+  U(d,hub,2.0);
+  // hydraulic pistons (8), each with its own speed / phase
+  float i8; vec2 s8=pmod(p.xz,8.0,i8);
+  float ext=pistonExt(i8);
+  float pr=length(vec2(s8.x,s8.y-30.9));
+  float barrel=max(pr-0.78, abs(p.y-6.4)-2.0);
+  barrel=min(barrel, max(pr-0.96, abs(abs(p.y-6.4)-2.0)-0.13));
+  barrel=min(barrel, sdBox(vec3(s8.x,p.y-5.0,s8.y-29.9), vec3(0.62,0.62,1.3)));
+  U(d,barrel,6.0);
+  float rtop=8.4+ext;
+  float prod=max(pr-0.33, abs(p.y-(8.4+rtop)*0.5)-(rtop-8.4)*0.5);
+  U(d,prod,3.0);
+  float head=sdBox(vec3(s8.x,p.y-rtop-0.45,s8.y-30.9), vec3(0.72,0.45,0.72))-0.08;
+  U(d,head,6.0);
+}
+
+// suspension tie-rods from forge to shaft wall
+void rods(vec3 p, inout float d){
+  float rr=length(p.xz);
+  float bound=max(max(26.3-rr, rr-71.5), max(3.4-p.y, p.y-60.5));
+  if(bound>d) return;
+  vec2 xz=rot(-TAU/16.0)*p.xz;
+  float i8; vec2 s=pmod(xz,8.0,i8);
+  vec2 A=vec2(27.6,4.4), B=vec2(68.8,58.0);
+  vec2 ab=B-A, pa=vec2(s.y,p.y)-A;
+  float h=clamp(dot(pa,ab)/dot(ab,ab),0.0,1.0);
+  float ds=length(pa-ab*h);
+  float L=length(ab), along=h*L;
+  float rad=length(vec2(s.x,ds));
+  U(d, rad-0.42, 3.0);
+  float tb=max(rad-0.72, abs(along-L*0.5)-1.4);
+  tb=min(tb, max(rad-0.58, abs(mod(along,6.0)-3.0)-0.17));
+  U(d,tb,6.0);
+  float anc=sdBox(vec3(s.x,p.y-58.0,s.y-69.6), vec3(1.2,1.7,1.5))-0.1;
+  anc=min(anc, sdBox(vec3(s.x,p.y-4.9,s.y-27.4), vec3(0.5,0.75,0.9)));
+  U(d,anc,1.0);
+}
+
+// cargo bridge + train
+void bridge(vec3 q, float wz, inout float d){
+  float kb=floor((q.y+58.0)/144.0+0.5);
+  float by=q.y+58.0-kb*144.0;
+  if(abs(by+2.5)-8.6>d) return;
+  vec2 xz=q.xz; float tz=wz;
+  if(kb!=0.0){ xz=rot(kb*1.3)*xz; tz=xz.y+kb*97.0; }
+  float bx=xz.x-7.0, bz=xz.y;
+  if(abs(bx)-6.0>d) return;
+  float deck=sdBox2(vec2(bx,by+0.45), vec2(5.6,0.45));
+  U(d,deck,2.0);
+  float curb=sdBox2(vec2(abs(bx)-5.35,by-0.55), vec2(0.25,0.55));
+  U(d,curb,6.0);
+  float rail=sdBox2(vec2(abs(bx)-0.8,by-0.12), vec2(0.07,0.12));
+  U(d,rail,3.0);
+  // warren truss girders
+  float gx=abs(bx)-4.8;
+  float zc=mod(bz,8.0)-4.0;
+  float sg=(mod(floor(bz/8.0),2.0)<1.0)?1.0:-1.0;
+  float bot=sdBox2(vec2(gx,by+6.0), vec2(0.36,0.36));
+  float top=sdBox2(vec2(gx,by+1.25), vec2(0.36,0.36));
+  float zb=mod(bz+4.0,8.0)-4.0;
+  float post=sdBox(vec3(gx,by+3.6,zb), vec3(0.28,2.4,0.28));
+  float dg=sdSeg(vec2(zc*sg,by), vec2(-4.0,-6.0), vec2(4.0,-1.25));
+  float diag=max(abs(gx)-0.22, dg-0.24);
+  U(d,min(min(bot,top),min(post,diag)),1.0);
+  float z4=mod(bz,4.0)-2.0;
+  float fb=sdBox(vec3(bx,by+1.25,z4), vec3(4.8,0.4,0.2));
+  float xb=max(abs(by+6.0)-0.12, sdSeg(vec2(abs(bx),abs(zc)), vec2(0.0), vec2(4.8,4.0))-0.12);
+  U(d,min(fb,xb),2.0);
+  float strip=sdBox2(vec2(gx,by+6.44), vec2(0.09,0.07));
+  gCyan=min(gCyan,strip); U(d,strip,5.0);
+  // train (6 cars)
+  if(abs(bx)<3.5 && by>-0.8 && by<6.0){
+    float tt=tz-uTime*14.0+276.0;
+    float zz=mod(tt+350.0,700.0)-350.0;
+    float ci=clamp(floor((zz+57.0)/19.0),0.0,5.0);
+    float cz=zz+57.0-ci*19.0-9.5;
+    vec3 cp=vec3(bx,by-2.75,cz);
+    float car;
+    if(mod(ci,2.0)<1.0) car=sdBox(cp,vec3(1.88,1.83,8.58))-0.12;
+    else car=min(sdCap(cp,vec3(0.0,0.35,-7.1),vec3(0.0,0.35,7.1),1.75), sdBox(cp-vec3(0.0,-1.55,0.0),vec3(1.9,0.35,8.8)));
+    U(d,car,7.0);
+    float bog=sdBox(vec3(bx,by-0.45,abs(cz)-6.2), vec3(1.25,0.4,1.3));
+    U(d,bog,1.0);
+    float lamp=sdBox(vec3(abs(bx)-1.6,by-4.35,abs(cz)-8.72), vec3(0.16,0.08,0.06));
+    gCyan=min(gCyan,lamp); U(d,lamp,5.0);
+  }
+}
+
+// elevator tower with cable-hung cabin
+void tower(vec3 q, float yg, inout float d){
+  vec2 rp=rot(0.9505)*(q.xz-vec2(30.0,-42.0));
+  float bound=sdBox2(rp-vec2(2.33,0.0), vec2(5.75,3.4));
+  if(bound>d) return;
+  float rx=rp.x, rz=rp.y, y=q.y;
+  vec2 cc=abs(vec2(rx,rz))-2.8;
+  float col=sdBox2(cc,vec2(0.3));
+  float y6b=mod(y+3.0,6.0)-3.0;
+  col=min(col, max(sdBox2(cc,vec2(0.48)), abs(y6b)-0.1));
+  float bm=min(max(sdBox2(vec2(abs(rx)-2.8,y6b),vec2(0.18)), abs(rz)-2.8),
+               max(sdBox2(vec2(abs(rz)-2.8,y6b),vec2(0.18)), abs(rx)-2.8));
+  float y6=mod(y,6.0)-3.0;
+  float br=max(0.08, gPix*0.5);
+  float xa=length(vec2(abs(rx)-2.8, sdSeg(vec2(abs(rz),abs(y6)),vec2(0.0),vec2(2.8,3.0))))-br;
+  float xc=length(vec2(abs(rz)-2.8, sdSeg(vec2(abs(rx),abs(y6)),vec2(0.0),vec2(2.8,3.0))))-br;
+  U(d,min(min(col,bm),min(xa,xc)),1.0);
+  float guide=sdBox2(vec2(rx,abs(rz)-2.35), vec2(0.09,0.12));
+  U(d,guide,3.0);
+  float cr=max(0.045, gPix*0.5);
+  float cab=length(abs(vec2(rx,rz))-0.45)-cr;
+  U(d,cab,3.0);
+  float yc=cabinY();
+  float cabin=sdBox(vec3(rx,y-yc,rz), vec3(2.12,2.6,2.12))-0.06;
+  cabin=min(cabin, sdBox(vec3(rx,y-yc-2.95,rz), vec3(1.0,0.35,1.0)));
+  cabin=min(cabin, sdBox(vec3(rx,y-yc+2.85,rz), vec3(1.6,0.25,1.6)));
+  U(d,cabin,6.0);
+  float win=min(sdBox(vec3(rx,y-yc-0.9,rz),vec3(2.2,0.28,1.5)), sdBox(vec3(rx,y-yc-0.9,rz),vec3(1.5,0.28,2.2)));
+  U(d,win,10.0);
+  float strut=sdBox(vec3(rx-5.4,yg+1.1,abs(rz)-2.0), vec3(2.6,0.45,0.3));
+  U(d,strut,1.0);
+}
+
+float worker(vec3 p, float pose, out float helm){
+  vec3 pl=vec3(p.x,p.y,abs(p.z)-0.12);
+  float d=sdCap(pl,vec3(0.0,0.1,0.0),vec3(0.0,0.84,0.0),0.085);
+  d=min(d, sdBox(pl-vec3(0.06,0.06,0.0), vec3(0.14,0.06,0.07)));
+  d=min(d, sdBox(p-vec3(0.0,1.18,0.0), vec3(0.1,0.29,0.18))-0.07);
+  d=min(d, length(p-vec3(0.02,1.61,0.0))-0.105);
+  vec3 pa=vec3(p.x,p.y,abs(p.z)-0.27);
+  d=min(d, sdCap(pa, vec3(0.0,1.42,0.0), vec3(0.12+pose*0.44,0.98+pose*0.1,0.0), 0.055));
+  helm=max(length(p-vec3(0.02,1.65,0.0))-0.135, -(p.y-1.63));
+  helm=min(helm, max(length(p.xz-vec2(0.05,0.0))-0.17, abs(p.y-1.635)-0.012));
+  return d;
+}
+
+// cantilevered inspection deck (+ workers on level 0)
+void deck(vec3 q, float yg, float kg, inout float d){
+  vec3 dp=vec3(q.x+55.55, yg, q.z);
+  float bound=sdBox(dp-vec3(0.0,1.2,0.0), vec3(3.5,3.6,5.5));
+  if(bound>d) return;
+  float slab=sdBox(dp-vec3(0.0,-0.22,0.0), vec3(3.05,0.22,5.0));
+  U(d,slab,2.0);
+  float g=sdBox(vec3(dp.x,dp.y+0.75,abs(dp.z)-3.6), vec3(3.0,0.35,0.18));
+  g=min(g, sdBox(vec3(dp.x-2.88,dp.y+0.6,dp.z), vec3(0.14,0.4,5.0)));
+  U(d,g,1.0);
+  float rp=max(0.03, gPix*0.55);
+  float fz=mod(dp.z+0.625,1.25)-0.625;
+  float postF=max(sdBox(vec3(dp.x-2.95,dp.y-0.55,fz), vec3(0.03,0.55,0.03)), abs(dp.z)-5.0);
+  float railF=max(min(length(vec2(dp.x-2.95,dp.y-1.1)), length(vec2(dp.x-2.95,dp.y-0.55)))-rp, abs(dp.z)-5.0);
+  float sx=mod(dp.x+0.625,1.25)-0.625;
+  float postS=max(sdBox(vec3(sx,dp.y-0.55,abs(dp.z)-5.0), vec3(0.03,0.55,0.03)), abs(dp.x)-2.95);
+  float railS=max(min(length(vec2(abs(dp.z)-5.0,dp.y-1.1)), length(vec2(abs(dp.z)-5.0,dp.y-0.55)))-rp, abs(dp.x)-2.95);
+  float toe=max(sdBox2(vec2(dp.x-2.95,dp.y-0.07),vec2(0.01,0.07)), abs(dp.z)-5.0);
+  U(d,min(min(min(postF,railF),min(postS,railS)),toe),6.0);
+  float pole=sdBox(vec3(dp.x+2.6,dp.y-1.7,dp.z-4.6), vec3(0.06,1.7,0.06));
+  pole=min(pole, sdBox(vec3(dp.x+2.1,dp.y-3.35,dp.z-4.6), vec3(0.55,0.05,0.05)));
+  U(d,pole,6.0);
+  float lamp=sdBox(vec3(dp.x+1.65,dp.y-3.22,dp.z-4.6), vec3(0.3,0.07,0.18));
+  U(d,lamp,10.0);
+  if(kg==0.0){
+    float hm;
+    vec3 w1=dp-vec3(2.2,0.0,3.2);
+    float a=worker(w1,1.0,hm); U(d,a,8.0); U(d,hm,9.0);
+    vec3 w2=dp-vec3(0.6,0.0,-3.4); w2.xz=rot(-0.5)*w2.xz;
+    float b=worker(w2,0.15,hm); U(d,b,8.0); U(d,hm,9.0);
+    float tl=sdBox(w2-vec3(0.22,0.98,0.29), vec3(0.06,0.04,0.04));
+    gCyan=min(gCyan,tl); U(d,tl,5.0);
+  }
+}
+
+// annular galleries every 36 m
+void gallery(vec3 q, float r, float u, float w, float yg, inout float d){
+  if(max(57.6-r, abs(yg+3.0)-4.6)>d) return;
+  float fl=sdBox2(vec2(r-64.0,yg+0.35), vec2(6.0,0.35));
+  U(d,fl,2.0);
+  float fas=sdBox2(vec2(r-58.3,yg+1.0), vec2(0.3,1.0));
+  U(d,fas,6.0);
+  float strip=sdBox2(vec2(r-57.98,yg+1.05), vec2(0.04,0.07));
+  gCyan=min(gCyan,strip); U(d,strip,5.0);
+  float beam=sdBox(vec3(u,yg+1.3,w-64.0), vec3(0.22,0.6,6.0));
+  float knee=max(abs(u)-0.2, sdSeg(vec2(w,yg), vec2(69.8,-7.0), vec2(59.0,-1.9))-0.22);
+  U(d,min(beam,knee),1.0);
+  float uu=mod(u+0.98125,1.9625)-0.98125;
+  float rp=max(0.03, gPix*0.55);
+  float post=sdBox(vec3(uu,yg-0.55,r-58.3), vec3(0.035,0.55,0.035));
+  float rail=min(post, min(length(vec2(r-58.3,yg-1.1))-rp, length(vec2(r-58.3,yg-0.55))-rp*0.8));
+  rail=max(rail, -sdBox2(vec2(q.x+54.0,q.z), vec2(6.0,5.1)));
+  U(d,rail,6.0);
+}
+
+// shaft wall: sponge mass, armour ribs, ledges, panels, pipes, energy channels
+void wallG(vec3 q, float r, float a, float idx, float u, float w, inout float d){
+  if(67.3-r>d) return;
+  vec3 sp=vec3(a*70.028, q.y+9.0, r-RW+27.5)*(1.0/27.5);
+  float mass=max(RW-r, sponge(sp)*27.5);
+  float y12=mod(q.y,12.0)-6.0;
+  mass=max(mass, -(sdBox(vec3(u,y12,w-RW), vec3(3.05,5.15,0.2))-0.05));
+  float rib=chamf2(vec2(u,w-69.0), vec2(0.55,1.45), 0.3);
+  bool slot=(mod(idx,7.0)==3.0) && (fract(q.y/48.0)<0.72);
+  if(slot) rib=max(rib, -sdBox2(vec2(u,w-67.55), vec2(0.17,0.32)));
+  rib=min(rib, sdBox(vec3(u,mod(q.y,3.0)-1.5,w-69.4), vec3(1.1,0.06,1.0)));
+  float yb=mod(q.y+6.0,12.0)-6.0;
+  float det=min(rib, chamf2(vec2(yb,w-69.3), vec2(0.42,1.15), 0.25));
+  float pipe=1e5;
+  if(mod(idx,4.0)==1.0){
+    float pr=length(vec2(abs(u)-2.15,w-68.95));
+    pipe=pr-0.42;
+    pipe=min(pipe, max(pr-0.66, abs(mod(q.y,8.0)-4.0)-0.1));
+    pipe=min(pipe, sdBox(vec3(abs(u)-2.15,mod(q.y+4.0,8.0)-4.0,w-69.6), vec3(0.55,0.12,0.45)));
+  }
+  float yp=mod(q.y+72.0,144.0)-72.0;
+  float portal=min(max(sdBox2(vec2(q.z,yp-18.0),vec2(14.0,22.0)), 60.5-abs(q.x)),
+                   max(sdBox2(vec2(q.x,yp-18.0),vec2(14.0,22.0)), 60.5-abs(q.z)));
+  float kb=floor((q.y+58.0)/144.0+0.5); float by=q.y+58.0-kb*144.0;
+  vec2 bxz=q.xz; if(kb!=0.0) bxz=rot(kb*1.3)*bxz;
+  float carve=min(portal, max(sdBox2(vec2(bxz.x-7.0,by-1.0),vec2(8.0,8.5)), 60.0-r));
+  U(d,max(mass,-carve),1.0);
+  U(d,max(det,-carve),1.0);
+  U(d,max(pipe,-carve),2.0);
+  if(slot){ float em=max(sdBox2(vec2(u,w-67.82),vec2(0.09)), -carve); gCyan=min(gCyan,em); U(d,em,5.0); }
+}
+
+float map(vec3 p){
+  gMat=1.0;
+  vec2 cid=floor(p.xz/CELL+0.5);
+  vec3 q=vec3(p.x-cid.x*CELL, p.y, p.z-cid.y*CELL);
+  float r=length(q.xz);
+  float d=1e5;
+  float kg=floor(q.y/36.0+0.5), yg=q.y-kg*36.0;
+  vec3 fp=vec3(q.x, mod(q.y+251.0,432.0)-216.0, q.z);
+  forge(fp,d);
+  bridge(q,p.z,d);
+  deck(q,yg,kg,d);
+  tower(q,yg,d);
+  rods(fp,d);
+  if(r>57.3){
+    float a=atan(q.z,q.x);
+    float sa=TAU/56.0, idx=floor(a/sa+0.5), al=a-idx*sa;
+    float u=r*sin(al), w=r*cos(al);
+    gallery(q,r,u,w,yg,d);
+    wallG(q,r,a,idx,u,w,d);
+  } else d=min(d, 57.8-r);
+  d=min(d, CELL*0.5-max(abs(q.x),abs(q.z))+0.8);
+  return d;
+}
+</script>
+
+<script id="fsScene" type="x-shader/x-fragment">
+out vec4 outColor;
+uniform vec2 uRes;
+uniform vec3 uCamPos;
+uniform mat3 uCamRot;
+uniform float uTanH;
+uniform vec2 uJitter;
+uniform int uPal;
+uniform int uSteps;
+vec3 cFog, cAmber, cCyan;
+float gPixA;
+
+float hash31(vec3 p){ p=fract(p*vec3(0.1031,0.1030,0.0973)); p+=dot(p,p.yzx+33.33); return fract((p.x+p.y)*p.z); }
+float vnoise(vec3 x){
+  vec3 i=floor(x), f=fract(x); f=f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash31(i),hash31(i+vec3(1,0,0)),f.x), mix(hash31(i+vec3(0,1,0)),hash31(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(hash31(i+vec3(0,0,1)),hash31(i+vec3(1,0,1)),f.x), mix(hash31(i+vec3(0,1,1)),hash31(i+vec3(1,1,1)),f.x),f.y), f.z);
+}
+
+vec3 calcNormal(vec3 p, float e){
+  const vec2 k=vec2(1,-1);
+  return normalize(k.xyy*map(p+k.xyy*e)+k.yyx*map(p+k.yyx*e)+k.yxy*map(p+k.yxy*e)+k.xxx*map(p+k.xxx*e));
+}
+float calcAO(vec3 p, vec3 n){
+  float occ=0.0, sca=1.0;
+  for(int i=0;i<4;i++){
+    float h=0.08+0.22*float(i*i);
+    float dd=map(p+n*h);
+    occ+=clamp((h-dd)/h,0.0,1.0)*sca; sca*=0.62;
+  }
+  float ao=clamp(1.0-occ*0.55,0.0,1.0);
+  float d8=map(p+n*7.0);
+  return ao*(1.0-0.55*clamp(1.0-d8/7.0,0.0,1.0));
+}
+float softShadow(vec3 ro, vec3 rd, float maxt){
+  float res=1.0, t=0.15;
+  for(int i=0;i<18;i++){
+    float h=map(ro+rd*t);
+    res=min(res, 7.0*h/t);
+    t+=clamp(h,0.25,6.0);
+    if(res<0.02 || t>maxt) break;
+  }
+  return clamp(res,0.0,1.0);
+}
+vec3 brdf(vec3 n, vec3 v, vec3 l, vec3 alb, float rough, float metal, vec3 T, float aniso){
+  vec3 h=normalize(l+v);
+  float nl=max(dot(n,l),0.0), nv=max(dot(n,v),1e-3), nh=max(dot(n,h),0.0), vh=max(dot(v,h),0.0);
+  float a=max(rough*rough,0.003), D;
+  if(aniso>0.0){
+    vec3 B=cross(n,T); float ax=a*(1.0+aniso), ay=a*(1.0-0.9*aniso);
+    float th=dot(T,h), bh=dot(B,h); float k=th*th/(ax*ax)+bh*bh/(ay*ay)+nh*nh; D=1.0/(PI*ax*ay*k*k);
+  } else { float a2=a*a; float k=nh*nh*(a2-1.0)+1.0; D=a2/(PI*k*k); }
+  float kk=(rough+1.0)*(rough+1.0)*0.125;
+  float G=(nl/(nl*(1.0-kk)+kk))*(nv/(nv*(1.0-kk)+kk));
+  vec3 F0=mix(vec3(0.04),alb,metal);
+  vec3 F=F0+(1.0-F0)*pow(1.0-vh,5.0);
+  vec3 spec=min(D*G*F/(4.0*nv*max(nl,1e-3)), vec3(60.0));
+  return ((1.0-F)*(1.0-metal)*alb/PI+spec)*nl;
+}
+// point light in-scatter through homogeneous medium (closed form)
+float inscatter(vec3 ro, vec3 rd, float T, vec3 L){
+  vec3 o=ro-L; float b=dot(o,rd); float h2=max(dot(o,o)-b*b, 0.25); float h=sqrt(h2);
+  return (atan((T+b)/h)-atan(b/h))/h;
+}
+float fogDens(float y){ return 0.0036+0.0042*sst(-30.0,-330.0,y); }
+vec3 fogColor(vec3 rd){ return cFog*(0.55+0.75*sst(-0.6,0.9,rd.y)); }
+vec3 forgeCenter(vec3 p){ vec2 cid=floor(p.xz/CELL+0.5); float fyl=mod(p.y+251.0,432.0)-216.0; return vec3(cid.x*CELL, p.y-fyl, cid.y*CELL); }
+
+// slowly sweeping light beams through the vanes
+vec3 beams(vec3 ro, vec3 rd, float tmax, float dith){
+  vec3 c=forgeCenter(ro);
+  vec3 o=ro-c;
+  float a=dot(rd.xz,rd.xz); if(a<1e-5) return vec3(0.0);
+  float b=dot(o.xz,rd.xz), cc=dot(o.xz,o.xz)-20.5*20.5;
+  float disc=b*b-a*cc; if(disc<0.0) return vec3(0.0);
+  float sq=sqrt(disc); float t0=(-b-sq)/a, t1=(-b+sq)/a;
+  if(abs(rd.y)>1e-4){ float ya=(1.5-o.y)/rd.y, yb=(95.0-o.y)/rd.y; t0=max(t0,min(ya,yb)); t1=min(t1,max(ya,yb)); }
+  t0=max(t0,0.0); t1=min(t1,tmax);
+  if(t1<=t0) return vec3(0.0);
+  vec3 acc=vec3(0.0); float dt=(t1-t0)/12.0; float ang=uTime*0.21;
+  vec3 Lp=vec3(0.0,-2.6,0.0);
+  for(int i=0;i<12;i++){
+    float tt=t0+(float(i)+dith)*dt;
+    vec3 s=o+rd*tt;
+    float r=length(s.xz);
+    float th=atan(s.z,s.x)+ang - 0.012*s.y;
+    float pat=sst(0.25,0.85,0.5-0.5*cos(14.0*th));
+    pat*=sst(4.5,7.0,r)*sst(21.0,18.0,r);
+    vec3 dl=s-Lp;
+    acc+=pat/(dot(dl,dl)+40.0)*exp(-tt*0.0045);
+  }
+  return acc*dt*cAmber*5200.0*0.0011;
+}
+
+vec3 envColor(vec3 R, vec3 p, float rough, vec3 Lf, float sh){
+  vec3 e=cFog*mix(0.8,4.5,sst(-0.4,0.9,R.y));
+  vec3 dl=Lf-p; float dd=dot(dl,dl); vec3 ld=dl*inversesqrt(dd);
+  float lobe=pow(max(dot(R,ld),0.0), mix(300.0,4.0,rough))*mix(40.0,1.0,rough);
+  e+=cAmber*lobe*2600.0/(dd+80.0)*(0.25+0.75*sh);
+  e+=cCyan*0.08*sst(0.2,1.0,abs(R.x*R.z)*2.0);
+  return e;
+}
+
+vec3 shade(vec3 p, vec3 n, vec3 rd, float t, float mat, float stepsF, out vec3 emisOut){
+  vec3 v=-rd;
+  float fp=t*gPixA;
+  float fade1=clamp(1.0-fp*22.0,0.0,1.0);
+  float fade2=clamp(1.0-fp*120.0,0.0,1.0);
+  vec2 cid=floor(p.xz/CELL+0.5);
+  vec3 q=vec3(p.x-cid.x*CELL, p.y, p.z-cid.y*CELL);
+  float r=length(q.xz);
+  vec3 fc=forgeCenter(p);
+  vec3 Lf=fc+vec3(0.0,-2.6,0.0);
+  vec3 fq=p-fc;
+  float frr=length(fq.xz);
+
+  emisOut=vec3(0.0);
+  // emissives
+  if(mat>3.5 && mat<4.5){
+    float turb=vnoise(vec3(fq.xz*0.32, uTime*0.35))*0.6+vnoise(vec3(fq.xz*1.1+uTime*0.2, uTime*0.6))*0.4;
+    float flick=0.88+0.12*sin(uTime*6.7+frr*0.4)*sin(uTime*2.3);
+    emisOut=mix(cAmber*vec3(1.0,0.55,0.4),cAmber,turb)*(1.8+6.0*turb*turb)*flick*mix(1.0,1.5,sst(18.0,21.5,frr));
+    return vec3(0.0);
+  }
+  if(mat>4.5 && mat<5.5){ emisOut=cCyan*(8.0+1.5*sin(uTime*2.1+p.y*0.4)); return vec3(0.0); }
+  if(mat>9.5 && mat<10.5){ emisOut=vec3(1.0,0.62,0.3)*14.0; return vec3(0.0); }
+
+  float nL=vnoise(p*0.11);
+  float nM=vnoise(p*0.83+3.1);
+  float nS=mix(0.5, vnoise(p*6.3+1.7), fade1);
+  float oil=sst(0.6,0.82, vnoise(vec3(p.x*0.42,p.y*0.08,p.z*0.42)+11.0));
+  float ein=-map(p-n*0.05);
+  float wear=sst(0.3,0.95, clamp(1.0-ein/0.05,0.0,1.0))*sst(0.3,0.7,nM+0.15);
+  vec3 T=normalize(abs(n.y)<0.95 ? cross(n,vec3(0,1,0)) : cross(n,vec3(1,0,0)));
+  vec3 B=cross(n,T);
+  vec3 alb; float rough, metal, aniso=0.0; vec3 nb=vec3(0.0); float emK=0.0;
+
+  if(mat<1.5){                      // rough cast iron / armour
+    alb=vec3(0.072,0.068,0.064)*(0.6+0.8*nS)*(0.7+0.6*nL);
+    alb=mix(alb, vec3(0.11,0.062,0.035), sst(0.62,0.9,nL)*0.7);
+    rough=0.8-0.22*nS; metal=0.6;
+    nb=(vec3(vnoise(p*11.0),vnoise(p*11.0+5.0),vnoise(p*11.0+9.0))-0.5)*0.45*fade1;
+    // weld beads at rib roots + rivet rows on ledges
+    if(r>66.0){
+      float sa=TAU/56.0; float a=atan(q.z,q.x); float al=a-floor(a/sa+0.5)*sa;
+      float u=r*sin(al), w=r*cos(al);
+      float weld=exp(-pow((abs(u)-0.62)/0.09,2.0))*exp(-pow((w-69.95)/0.12,2.0));
+      weld=max(weld, exp(-pow((abs(u)-0.62)/0.09,2.0))*exp(-pow((w-68.15)/0.12,2.0))*step(fract(q.y/3.0),0.5));
+      float rip=0.5+0.5*sin(q.y*55.0);
+      alb=mix(alb, vec3(0.16,0.14,0.12)*(0.7+0.5*rip), weld*fade1);
+      rough=mix(rough,0.5,weld);
+      nb+=B*(rip-0.5)*0.9*weld*fade2;
+      vec2 rv=vec2(mod(q.y+0.25,0.5)-0.25, mod(u+0.25,0.5)-0.25);
+      float riv=sst(0.075,0.045,length(rv))*step(abs(mod(q.y+6.0,12.0)-6.0),0.42)*step(w,68.3);
+      alb=mix(alb, vec3(0.2), riv*0.6*fade1); nb+=n*0.0; rough=mix(rough,0.4,riv);
+    }
+    // heat on the forge mouth
+    if(frr<24.0 && abs(fq.y)<5.0){ emK=sst(23.8,21.4,frr)*sst(4.6,0.5,abs(fq.y+0.2)); }
+    if(frr>28.5 && frr<29.3 && abs(fq.y)<4.5){ emK=max(emK, 0.55*exp(-pow((abs(fq.y)-1.9)/0.06,2.0))*(0.7+0.3*sin(uTime*1.7+atan(fq.z,fq.x)*5.0))); }
+  } else if(mat<2.5){               // brushed steel plate
+    alb=vec3(0.28,0.29,0.31)*(0.75+0.35*nL);
+    float br=mix(0.5, vnoise(vec3(dot(p,T)*0.7, dot(p,B)*85.0, 0.0)), fade2);
+    rough=0.3+0.22*(br-0.5)+0.12*nS; metal=1.0; aniso=0.75;
+    nb=B*(br-0.5)*0.25*fade2;
+    if(n.y>0.8){                    // tread-plate seams on floors
+      vec2 g=abs(fract(p.xz/1.5)-0.5);
+      float seam=sst(0.485,0.495,max(g.x,g.y));
+      alb*=1.0-0.6*seam*fade1;
+      float dia=fract((p.x+p.z)*3.0)*fract((p.x-p.z)*3.0);
+      nb+=(vec3(fract(p.x*6.0),0.0,fract(p.z*6.0))-0.5)*0.12*fade2*step(0.2,dia);
+    }
+  } else if(mat<3.5){               // polished piston rods, cables, rails
+    alb=vec3(0.62,0.63,0.66); rough=0.08+0.08*nM; metal=1.0; aniso=0.55;
+    float lines=mix(0.5, vnoise(vec3(dot(p,T)*1.0, p.y*120.0, 0.0)), fade2);
+    rough+=0.06*lines;
+  } else if(mat<6.5){               // ochre painted steel
+    alb=mix(vec3(0.19,0.13,0.055), vec3(0.06,0.065,0.07), sst(0.45,0.7,nL))*(0.7+0.5*nM);
+    rough=0.55+0.15*nS; metal=0.1;
+    alb=mix(alb, vec3(0.42,0.42,0.44), wear); metal=mix(metal,1.0,wear); rough=mix(rough,0.3,wear);
+  } else if(mat<7.5){               // train cars
+    float cidz=floor((p.z-uTime*14.0+276.0+57.0)/19.0);
+    float hc=fract(sin(cidz*12.9898)*43758.55);
+    alb=hc<0.33? vec3(0.22,0.06,0.04) : (hc<0.66? vec3(0.08,0.13,0.13) : vec3(0.24,0.17,0.05));
+    alb*=0.6+0.6*nM;
+    alb=mix(alb, vec3(0.03), sst(-56.0,-55.0,p.y)*0.0+0.35*sst(0.5,0.9,nL));
+    rough=0.6; metal=0.25;
+    float cor=sin(p.z*10.5);
+    nb+=vec3(0.0,0.0,1.0)*cor*0.35*fade1*step(abs(n.z),0.5);
+    alb=mix(alb, vec3(0.4), wear); metal=mix(metal,1.0,wear);
+  } else if(mat<8.5){               // worker coveralls + retro-reflective bands
+    alb=vec3(0.05,0.055,0.06)*(0.8+0.4*nS); rough=0.85; metal=0.0;
+    float ly=p.y-floor(p.y/36.0+0.5)*36.0;
+    float band=step(abs(ly-1.02),0.035)+step(abs(ly-0.42),0.03);
+    alb=mix(alb, vec3(0.85,0.85,0.7), band); emK=band*0.08;
+  } else if(mat<9.5){               // helmet
+    alb=vec3(0.55,0.32,0.05); rough=0.35; metal=0.0;
+  } else {                          // heat-tinted vanes
+    alb=mix(vec3(0.09,0.08,0.075), vec3(0.16,0.09,0.12), sst(0.3,0.8,nM)); rough=0.42; metal=1.0;
+    emK=sst(-1.4,-2.3,fq.y)*0.5;
+  }
+  if(mat<2.5 || (mat>5.5&&mat<6.5)){
+    alb*=mix(1.0,0.45,oil); rough=mix(rough,0.16,oil*0.85);
+  }
+  if(mat<2.5){
+    alb=mix(alb, vec3(0.42,0.42,0.44), wear*0.85); rough=mix(rough,0.26,wear); metal=mix(metal,1.0,wear);
+  }
+  n=normalize(n+nb-n*dot(n,nb));
+
+  float ao=calcAO(p,n);
+  float stepOcc=1.0-0.28*sst(25.0,170.0,stepsF);
+  vec3 col=vec3(0.0);
+
+  // forge light (shadowed)
+  vec3 ld=Lf-p; float dl=length(ld); ld/=dl;
+  float flick=0.9+0.1*sin(uTime*5.3)*sin(uTime*2.1+1.0);
+  float att=5200.0*flick/(dl*dl+6.0);
+  float sh=0.0;
+  if(dot(n,ld)>0.0 && att>0.035){ sh=softShadow(p+n*0.06, ld, dl-2.5); col+=brdf(n,v,ld,alb,rough,metal,T,aniso)*cAmber*att*sh; }
+
+  // deck sodium lamp
+  float kg=floor(q.y/36.0+0.5);
+  vec3 Ld=vec3(cid.x*CELL-57.2, kg*36.0+2.95, cid.y*CELL+4.6);
+  vec3 l2=Ld-p; float d2=length(l2); l2/=d2;
+  col+=brdf(n,v,l2,alb,rough,metal,T,aniso)*vec3(1.0,0.56,0.22)*36.0/(d2*d2+0.6)*pow(clamp(1.0-d2/26.0,0.0,1.0),2.0);
+  // elevator cabin lamp
+  vec2 tw=vec2(30.0,-42.0);
+  vec3 Lc=vec3(cid.x*CELL+tw.x, cabinY()-3.3, cid.y*CELL+tw.y);
+  vec3 l3=Lc-p; float d3=length(l3); l3/=d3;
+  col+=brdf(n,v,l3,alb,rough,metal,T,aniso)*vec3(1.0,0.7,0.42)*90.0/(d3*d3+1.0)*pow(clamp(1.0-d3/40.0,0.0,1.0),2.0);
+
+  // cyan energy channels (line lights)
+  {
+    float sa=TAU/56.0; float a=atan(q.z,q.x);
+    float m=floor((a/sa-3.0)/7.0+0.5); float ang=(7.0*m+3.0)*sa;
+    vec3 Ls=vec3(cid.x*CELL+67.75*cos(ang), p.y, cid.y*CELL+67.75*sin(ang));
+    float gate=sst(0.78,0.66,fract(p.y/48.0))*sst(-0.02,0.06,fract(p.y/48.0));
+    vec3 l4=Ls-p; float d4=length(l4); l4/=max(d4,1e-3);
+    col+=brdf(n,v,l4,alb,rough,metal,T,aniso)*cCyan*7.0*gate/(1.0+d4*d4*0.35)*exp(-d4*0.04);
+    vec3 Lg=vec3(cid.x*CELL, kg*36.0-1.05, cid.y*CELL)+vec3(normalize(q.xz+1e-4).x*57.95,0.0,normalize(q.xz+1e-4).y*57.95);
+    vec3 l5=Lg-p; float d5=length(l5); l5/=max(d5,1e-3);
+    col+=brdf(n,v,l5,alb,rough,metal,T,aniso)*cCyan*4.0/(1.0+d5*d5*0.3)*sst(59.0,57.5,r);
+    float kb=floor((q.y+58.0)/144.0+0.5);
+    if(kb==0.0){
+      float bx=q.x-7.0;
+      vec3 Lb=vec3(cid.x*CELL+7.0+sign(bx)*4.8, -64.44, p.z);
+      vec3 l6=Lb-p; float d6=length(l6); l6/=max(d6,1e-3);
+      col+=brdf(n,v,l6,alb,rough,metal,T,aniso)*cCyan*9.0/(1.0+d6*d6*0.25)*exp(-d6*0.05);
+    }
+  }
+  // ambient + environment reflections
+  vec3 amb=mix(cAmber*0.012+vec3(0.002), cFog*3.2+vec3(0.004,0.006,0.008), 0.5+0.5*n.y);
+  col+=alb*(1.0-metal*0.7)*amb*ao;
+  vec3 R=reflect(rd,n);
+  float nv=max(dot(n,v),0.0);
+  vec3 F0=mix(vec3(0.04),alb,metal);
+  vec3 Fr=F0+(max(vec3(1.0-rough),F0)-F0)*pow(1.0-nv,5.0);
+  col+=envColor(R,p,rough,Lf,sh)*Fr*ao*(1.0-0.55*rough);
+  col*=stepOcc;
+  emisOut=cAmber*emK*6.0;
+  return col;
+}
+
+void main(){
+  if(uPal==1){ cFog=vec3(0.020,0.016,0.012); cAmber=vec3(1.0,0.36,0.07); cCyan=vec3(0.25,0.95,0.80); }
+  else if(uPal==2){ cFog=vec3(0.011,0.016,0.024); cAmber=vec3(1.0,0.22,0.08); cCyan=vec3(0.55,0.85,1.0); }
+  else { cFog=vec3(0.009,0.021,0.044); cAmber=vec3(1.0,0.42,0.11); cCyan=vec3(0.12,0.78,1.0); }
+
+  vec2 frag=gl_FragCoord.xy+uJitter;
+  vec2 ndc=frag/uRes*2.0-1.0;
+  float aspect=uRes.x/uRes.y;
+  vec3 rd=normalize(uCamRot*vec3(ndc.x*aspect*uTanH, ndc.y*uTanH, 1.0));
+  vec3 ro=uCamPos;
+  gPixA=2.0*uTanH/uRes.y;
+  const float FAR=720.0;
+  float dith=fract(52.9829189*fract(dot(gl_FragCoord.xy, vec2(0.06711056,0.00583715)))+uJitter.x*7.13);
+
+  float t=0.02, steps=0.0; bool hit=false; float glowC=0.0, glowA=0.0; float mat=0.0;
+  for(int i=0;i<260;i++){
+    if(i>=uSteps) break;
+    vec3 p=ro+rd*t;
+    gPix=t*gPixA;
+    gCyan=1e5; gAmber=1e5;
+    float d=map(p);
+    float sl=min(d,3.0);
+    glowC+=sl*exp(-gCyan*1.3);
+    glowA+=sl*exp(-gAmber*0.35);
+    if(d<gPix*0.6){ hit=true; mat=gMat; break; }
+    t+=d*0.97;
+    steps+=1.0;
+    if(t>FAR) break;
+  }
+  vec3 col;
+  float tt=min(t,FAR);
+  if(hit){
+    vec3 p=ro+rd*t;
+    vec3 n=calcNormal(p, max(0.0015, t*gPixA*0.6));
+    vec3 em;
+    col=shade(p,n,rd,t,mat,steps,em);
+    col+=em;
+  } else col=vec3(0.0);
+  float dens=fogDens(mix(ro.y, ro.y+rd.y*tt, 0.5));
+  float Tr=exp(-tt*dens);
+  col=col*Tr+fogColor(rd)*(1.0-Tr);
+  // volumetric in-scatter
+  vec3 fc0=forgeCenter(ro)+vec3(0.0,-2.6,0.0);
+  float ins=inscatter(ro,rd,tt,fc0);
+  vec3 fc1=forgeCenter(ro+rd*tt)+vec3(0.0,-2.6,0.0);
+  if(distance(fc0,fc1)>1.0) ins+=inscatter(ro,rd,tt,fc1)*exp(-distance(ro,fc1)*0.004);
+  col+=cAmber*5200.0*0.00012*ins;
+  col+=beams(ro,rd,tt,dith);
+  vec2 cid=floor(ro.xz/CELL+0.5);
+  float kg=floor(ro.y/36.0+0.5);
+  vec3 Ld=vec3(cid.x*CELL-57.2, kg*36.0+2.95, cid.y*CELL+4.6);
+  col+=vec3(1.0,0.56,0.22)*36.0*0.004*inscatter(ro,rd,tt,Ld);
+  vec3 Lc=vec3(cid.x*CELL+30.0, cabinY()-3.3, cid.y*CELL-42.0);
+  col+=vec3(1.0,0.7,0.42)*90.0*0.003*inscatter(ro,rd,tt,Lc);
+  col+=cCyan*glowC*0.03+cAmber*glowA*0.006;
+  col=max(col,vec3(0.0));
+  outColor=vec4(min(col,vec3(400.0)), tt);
+}
+</script>
+
+<!-- ================= TAA ================= -->
+<script id="fsTAA" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform sampler2D uCur, uHist;
+uniform vec2 uRes;
+uniform vec3 uCamPos, uPrevPos;
+uniform mat3 uCamRot, uPrevRot;
+uniform float uTanH, uReset, uAlpha;
+float luma(vec3 c){ return dot(c,vec3(0.2126,0.7152,0.0722)); }
+vec3 tm(vec3 c){ return c/(1.0+luma(c)); }
+vec3 itm(vec3 c){ return c/max(1.0-luma(c),1e-4); }
+vec3 toYC(vec3 c){ return vec3(0.25*c.r+0.5*c.g+0.25*c.b, 0.5*c.r-0.5*c.b, -0.25*c.r+0.5*c.g-0.25*c.b); }
+vec3 fromYC(vec3 y){ return vec3(y.x+y.y-y.z, y.x+y.z, y.x-y.y-y.z); }
+vec3 sampleCR(sampler2D tex, vec2 uv, vec2 res){
+  vec2 sp=uv*res, tp=floor(sp-0.5)+0.5, f=sp-tp;
+  vec2 w0=f*(-0.5+f*(1.0-0.5*f)), w1=1.0+f*f*(-2.5+1.5*f), w2=f*(0.5+f*(2.0-1.5*f)), w3=f*f*(-0.5+0.5*f);
+  vec2 w12=w1+w2, tc12=(tp+w2/w12)/res, tc0=(tp-1.0)/res, tc3=(tp+2.0)/res;
+  vec3 r=textureLod(tex,vec2(tc12.x,tc0.y),0.0).rgb*(w12.x*w0.y)
+        +textureLod(tex,vec2(tc0.x,tc12.y),0.0).rgb*(w0.x*w12.y)
+        +textureLod(tex,tc12,0.0).rgb*(w12.x*w12.y)
+        +textureLod(tex,vec2(tc3.x,tc12.y),0.0).rgb*(w3.x*w12.y)
+        +textureLod(tex,vec2(tc12.x,tc3.y),0.0).rgb*(w12.x*w3.y);
+  float ws=w12.x*w0.y+w0.x*w12.y+w12.x*w12.y+w3.x*w12.y+w12.x*w3.y;
+  return max(r/ws, vec3(0.0));
+}
+void main(){
+  ivec2 ip=ivec2(gl_FragCoord.xy);
+  vec4 c=texelFetch(uCur,ip,0);
+  vec3 cur=tm(c.rgb);
+  vec3 m1=vec3(0.0), m2=vec3(0.0);
+  for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++){
+    vec3 s=toYC(tm(texelFetch(uCur, clamp(ip+ivec2(x,y), ivec2(0), ivec2(uRes)-1), 0).rgb));
+    m1+=s; m2+=s*s;
+  }
+  vec3 mu=m1/9.0, sig=sqrt(max(m2/9.0-mu*mu,0.0));
+  vec3 mn=mu-1.2*sig, mx=mu+1.2*sig;
+  vec2 ndc=gl_FragCoord.xy/uRes*2.0-1.0;
+  float aspect=uRes.x/uRes.y;
+  vec3 rd=normalize(uCamRot*vec3(ndc.x*aspect*uTanH, ndc.y*uTanH, 1.0));
+  vec3 wp=uCamPos+rd*c.a;
+  vec3 v=transpose(uPrevRot)*(wp-uPrevPos);
+  vec2 pn=(v.xy/max(v.z,1e-3))/vec2(aspect*uTanH, uTanH);
+  vec2 puv=pn*0.5+0.5;
+  float a=uAlpha;
+  if(uReset>0.5 || v.z<0.01 || any(lessThan(puv,vec2(0.0))) || any(greaterThan(puv,vec2(1.0)))) a=1.0;
+  vec3 res=cur;
+  if(a<1.0){
+    vec3 h=toYC(tm(sampleCR(uHist,puv,uRes)));
+    h=clamp(h,mn,mx);
+    res=mix(fromYC(h),cur,a);
+  }
+  outColor=vec4(itm(res), c.a);
+}
+</script>
+
+<!-- ================= POST ================= -->
+<script id="fsPost" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+out vec4 outColor;
+uniform sampler2D uTex;
+uniform vec2 uOut;
+uniform float uTime, uExposure;
+float sst(float a,float b,float x){ float t=clamp((x-a)/(b-a),0.0,1.0); return t*t*(3.0-2.0*t); }
+vec3 aces(vec3 x){ x*=0.6; return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }
+float h12(vec2 p){ vec3 p3=fract(vec3(p.xyx)*0.1031); p3+=dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
+void main(){
+  vec2 uv=gl_FragCoord.xy/uOut;
+  vec2 cc=uv-0.5;
+  float r2=dot(cc*vec2(uOut.x/uOut.y,1.0),cc*vec2(uOut.x/uOut.y,1.0));
+  vec2 off=cc*r2*0.0065;
+  vec3 col;
+  col.r=textureLod(uTex,uv-off,0.0).r;
+  col.g=textureLod(uTex,uv,0.0).g;
+  col.b=textureLod(uTex,uv+off,0.0).b;
+  vec3 bl=textureLod(uTex,uv,2.0).rgb*0.12+textureLod(uTex,uv,3.5).rgb*0.22+textureLod(uTex,uv,5.0).rgb*0.3+textureLod(uTex,uv,6.5).rgb*0.36;
+  bl=max(bl-0.06,0.0);
+  col+=bl*0.075;
+  col=aces(col*uExposure);
+  float vig=sst(1.25,0.25,length(cc*vec2(1.05,1.55)));
+  col*=mix(0.32,1.0,vig);
+  col=pow(col,vec3(1.0/2.2));
+  col+=(h12(gl_FragCoord.xy+fract(uTime*37.0)*500.0)-0.5)*0.018;
+  outColor=vec4(col,1.0);
+}
+</script>
+
+<script id="fsProbe" type="x-shader/x-fragment">
+out vec4 outColor;
+uniform sampler2D uPts;
+void main(){ vec3 p=texelFetch(uPts, ivec2(gl_FragCoord.x,0),0).xyz; gPix=0.0; gCyan=1e5; gAmber=1e5; float d=map(p); outColor=vec4(d,gMat,0.0,1.0); }
+</script>
+
+<script>
+'use strict';
+const Q=new URLSearchParams(location.search);
+const CAPTURE=Q.has('capture');
+const canvas=document.getElementById('c');
+const errBox=document.getElementById('err');
+function fail(m){ errBox.style.display='block'; errBox.textContent=m; throw new Error(m); }
+const gl=canvas.getContext('webgl2',{antialias:false,alpha:false,depth:false,stencil:false,preserveDrawingBuffer:CAPTURE,powerPreference:'high-performance'});
+if(!gl) fail('需要支援 WebGL2 的瀏覽器。');
+const hasCBF=!!gl.getExtension('EXT_color_buffer_float');
+gl.getExtension('OES_texture_float_linear');
+const HDR=hasCBF?gl.RGBA16F:gl.RGBA8;
+
+const src=id=>document.getElementById(id).textContent;
+function compile(type,s){ const sh=gl.createShader(type); gl.shaderSource(sh,s); gl.compileShader(sh);
+  if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS)) fail('Shader error:\n'+gl.getShaderInfoLog(sh)); return sh; }
+function program(fs){ const p=gl.createProgram(); gl.attachShader(p,compile(gl.VERTEX_SHADER,src('vs'))); gl.attachShader(p,compile(gl.FRAGMENT_SHADER,fs));
+  gl.linkProgram(p); if(!gl.getProgramParameter(p,gl.LINK_STATUS)) fail('Link error:\n'+gl.getProgramInfoLog(p));
+  const u={}; const n=gl.getProgramParameter(p,gl.ACTIVE_UNIFORMS); for(let i=0;i<n;i++){ const a=gl.getActiveUniform(p,i); u[a.name]=gl.getUniformLocation(p,a.name);} return {p,u}; }
+const HEAD='#version 300 es\n';
+const PS=program(HEAD+src('fsCommon')+src('fsScene'));
+const PT=program(src('fsTAA'));
+const PP=program(src('fsPost'));
+const vao=gl.createVertexArray();
+
+// ---------- render targets ----------
+let W=0,H=0,IW=0,IH=0,scale=CAPTURE?1:0.72;
+let sceneTex,sceneFB,hist=[],histFB=[],histLevels=1,cur=0,resetTAA=true;
+function mkTex(w,h,levels){ const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t); gl.texStorage2D(gl.TEXTURE_2D,levels,HDR,w,h);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,levels>1?gl.LINEAR_MIPMAP_LINEAR:gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE); return t; }
+function mkFB(t){ const f=gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER,f); gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0); return f; }
+function alloc(){
+  [sceneTex,...hist].forEach(t=>t&&gl.deleteTexture(t)); [sceneFB,...histFB].forEach(f=>f&&gl.deleteFramebuffer(f));
+  IW=Math.max(16,Math.round(W*scale)); IH=Math.max(16,Math.round(H*scale));
+  histLevels=Math.floor(Math.log2(Math.max(IW,IH)))+1;
+  sceneTex=mkTex(IW,IH,1); sceneFB=mkFB(sceneTex);
+  hist=[mkTex(IW,IH,histLevels),mkTex(IW,IH,histLevels)]; histFB=[mkFB(hist[0]),mkFB(hist[1])];
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null); resetTAA=true;
+}
+function resize(w,h){
+  if(!w){ const dpr=Math.min(window.devicePixelRatio||1,1.5); w=Math.round(innerWidth*dpr); h=Math.round(innerHeight*dpr); }
+  if(w===W&&h===H) return; W=canvas.width=w; H=canvas.height=h; alloc();
+}
+
+// ---------- camera path (30 s shot, loops through the portal into the next shaft) ----------
+//        t      x       y      z     yaw   pitch (deg)
+const KEYS=[
+  [0,   -57.6,  2.0,    0.0,    0,  -16],
+  [3,   -55.6,  1.9,   -0.4,    2,  -18],
+  [6,   -52.6,  1.6,   -1.5,    5,  -20],
+  [8,   -48.5,  0.40,  -3.2,    9,  -22],
+  [11,  -34.0, -9.0,  -16.0,   18,  -24],
+  [14,  -26.0, -33.0, -25.5,   60,  -10],
+  [16,   -9.0, -63.0, -35.0,   72,  -38],
+  [17.5,  8.0, -71.0, -39.0,  118,    6],
+  [20,   22.0, -73.0, -36.0,  178,   34],
+  [23,   30.0, -62.0, -28.0,  262,   52],
+  [27,   24.0, -16.0, -31.0,  296,   30],
+  [30,   54.0,  12.0,  -7.0,  356,    2],
+  [34,  100.0,  7.0,   -3.0,  362,   -2],
+  [38,  128.0,  2.6,   -1.0,  361,   -8],
+  [42,  142.4,  2.0,    0.0,  360,  -16]];
+const LOOP=42, NK=KEYS.length-1, CELLX=200;
+function key(i){ const n=Math.floor(i/NK), k=i-n*NK, K=KEYS[k]; return [K[0]+n*LOOP,K[1]+n*CELLX,K[2],K[3],K[4]+n*360,K[5]]; }
+function pathAt(t){
+  const n=Math.floor(t/LOOP), tl=t-n*LOOP; let k=0; while(k<NK-1&&KEYS[k+1][0]<=tl) k++;
+  const i=n*NK+k, A=key(i),B=key(i+1),P=key(i-1),N=key(i+2);
+  const dt=B[0]-A[0], s=(t-A[0])/dt, s2=s*s, s3=s2*s;
+  const h00=2*s3-3*s2+1,h10=s3-2*s2+s,h01=-2*s3+3*s2,h11=s3-s2;
+  const o=[];
+  for(let c=1;c<6;c++){ const m0=(B[c]-P[c])/(B[0]-P[0])*dt, m1=(N[c]-A[c])/(N[0]-A[0])*dt; o.push(h00*A[c]+h10*m0+h01*B[c]+h11*m1); }
+  return {pos:[o[0],o[1],o[2]], yaw:o[3]*Math.PI/180, pitch:o[4]*Math.PI/180};
+}
+function vnz(t,s){ return Math.sin(t*11.3+s)*0.5+Math.sin(t*17.9+s*2.1)*0.3+Math.sin(t*29.7+s*3.7)*0.2; }
+function camBasis(yaw,pitch){
+  const f=[Math.cos(pitch)*Math.cos(yaw),Math.sin(pitch),Math.cos(pitch)*Math.sin(yaw)];
+  let r=[-f[2],0,f[0]]; const rl=Math.hypot(r[0],r[2])||1; r=[r[0]/rl,0,r[2]/rl];
+  const u=[r[1]*f[2]-r[2]*f[1], r[2]*f[0]-r[0]*f[2], r[0]*f[1]-r[1]*f[0]];
+  return new Float32Array([...r,...u,...f]);
+}
+
+// ---------- state ----------
+const S={mech:0,cruise:0,paused:false,manual:false,blend:0,blendFrom:null,pal:0,
+  pos:[0,0,0],yaw:0,pitch:0, mx:0,my:0, offY:0,offP:0, keys:{}, drag:null, joy:null, frame:0};
+let prevCam=null;
+const PAL=['ABYSS','SODIUM','ICE'];
+
+function cruisePose(t){
+  const c=pathAt(t);
+  const amp=1+1.6*Math.exp(-Math.pow((t%LOOP)-16.8,2)*0.6);
+  c.pos[0]+=vnz(t,1)*0.010*amp; c.pos[1]+=vnz(t,2)*0.012*amp; c.pos[2]+=vnz(t,3)*0.010*amp;
+  c.yaw+=vnz(t*1.3,4)*0.0011*amp; c.pitch+=vnz(t*1.2,5)*0.0011*amp;
+  return c;
+}
+function currentPose(){
+  if(S.manual) return {pos:S.pos.slice(),yaw:S.yaw,pitch:S.pitch};
+  const c=cruisePose(S.cruise);
+  c.yaw+=S.offY; c.pitch+=S.offP;
+  if(S.blend>0&&S.blendFrom){ const k=S.blend, e=k*k*(3-2*k), F=S.blendFrom;
+    c.pos=c.pos.map((v,i)=>F.pos[i]+(v-F.pos[i])*e);
+    let dy=c.yaw-F.yaw; dy=((dy+Math.PI)%(2*Math.PI)+2*Math.PI)%(2*Math.PI)-Math.PI;
+    c.yaw=F.yaw+dy*e; c.pitch=F.pitch+(c.pitch-F.pitch)*e; }
+  return c;
+}
+function takeManual(){ if(S.manual) return; const c=currentPose(); S.pos=c.pos; S.yaw=c.yaw; S.pitch=c.pitch; S.manual=true; S.blend=0; }
+
+// ---------- input ----------
+addEventListener('keydown',e=>{ S.keys[e.code]=true;
+  if(e.code==='KeyR'){ if(S.manual){ S.blendFrom={pos:S.pos.slice(),yaw:S.yaw,pitch:S.pitch}; S.manual=false; S.blend=1e-6; } }
+  if(e.code==='KeyP'){ S.cruise=0; S.mech=0; S.manual=false; S.blend=0; S.offY=S.offP=0; resetTAA=true; }
+  if(['KeyW','KeyA','KeyS','KeyD','KeyQ','KeyE'].includes(e.code)) takeManual();
+});
+addEventListener('keyup',e=>{ S.keys[e.code]=false; });
+addEventListener('blur',()=>{ S.keys={}; });
+canvas.addEventListener('pointerdown',e=>{
+  canvas.setPointerCapture(e.pointerId);
+  if(e.pointerType==='touch' && e.clientX<innerWidth*0.5 && e.clientY>innerHeight*0.42){
+    S.joy={id:e.pointerId,x0:e.clientX,y0:e.clientY,x:0,y:0}; takeManual();
+    const j=document.getElementById('joy'); j.style.display='block'; j.style.left=e.clientX+'px'; j.style.top=e.clientY+'px';
+  } else { S.drag={id:e.pointerId,x:e.clientX,y:e.clientY}; takeManual(); }
+});
+canvas.addEventListener('pointermove',e=>{
+  if(S.joy&&e.pointerId===S.joy.id){ let dx=(e.clientX-S.joy.x0)/42, dy=(e.clientY-S.joy.y0)/42; const l=Math.hypot(dx,dy); if(l>1){dx/=l;dy/=l;}
+    S.joy.x=dx; S.joy.y=dy; document.querySelector('#joy i').style.transform=`translate(${dx*30}px,${dy*30}px)`; return; }
+  if(S.drag&&e.pointerId===S.drag.id){ const k=e.pointerType==='touch'?0.005:0.0032;
+    S.yaw+=(e.clientX-S.drag.x)*k; S.pitch=Math.max(-1.5,Math.min(1.5,S.pitch-(e.clientY-S.drag.y)*k)); S.drag.x=e.clientX; S.drag.y=e.clientY; return; }
+  if(e.pointerType==='mouse'){ S.mx=e.clientX/innerWidth-0.5; S.my=e.clientY/innerHeight-0.5; }
+});
+function endPtr(e){ if(S.joy&&e.pointerId===S.joy.id){ S.joy=null; document.getElementById('joy').style.display='none'; document.querySelector('#joy i').style.transform=''; }
+  if(S.drag&&e.pointerId===S.drag.id) S.drag=null; }
+canvas.addEventListener('pointerup',endPtr); canvas.addEventListener('pointercancel',endPtr);
+canvas.addEventListener('pointerleave',e=>{ if(e.pointerType==='mouse'){ S.mx=0; S.my=0; } });
+const bPause=document.getElementById('bPause'), bPal=document.getElementById('bPal');
+bPause.onclick=()=>{ S.paused=!S.paused; bPause.textContent=S.paused?'▶ RESUME':'❚❚ PAUSE'; };
+bPal.onclick=()=>{ S.pal=(S.pal+1)%3; bPal.textContent='PAL·'+PAL[S.pal]; };
+
+function update(dt){
+  if(!S.paused){ S.mech+=dt; if(!S.manual) S.cruise+=dt; }
+  if(S.blend>0){ S.blend+=dt/2.5; if(S.blend>=1){ S.blend=0; S.blendFrom=null; } }
+  const tk=1-Math.exp(-dt*3);
+  S.offY+=(S.mx*0.34-S.offY)*tk; S.offP+=(-S.my*0.2-S.offP)*tk;
+  if(S.manual){
+    const K=S.keys; let fw=(K.KeyW?1:0)-(K.KeyS?1:0), st=(K.KeyD?1:0)-(K.KeyA?1:0), up=(K.KeyE?1:0)-(K.KeyQ?1:0);
+    if(S.joy){ fw-=S.joy.y; st+=S.joy.x; }
+    const sp=(K.ShiftLeft||K.ShiftRight?28:7)*dt;
+    const f=[Math.cos(S.pitch)*Math.cos(S.yaw),Math.sin(S.pitch),Math.cos(S.pitch)*Math.sin(S.yaw)], r=[-Math.sin(S.yaw),0,Math.cos(S.yaw)];
+    for(let i=0;i<3;i++) S.pos[i]+=(f[i]*fw+r[i]*st+(i===1?up:0))*sp;
+  }
+}
+
+// ---------- frame ----------
+const halton=(i,b)=>{ let f=1,r=0; while(i>0){ f/=b; r+=f*(i%b); i=Math.floor(i/b);} return r; };
+const TANH=Math.tan(31*Math.PI/180);
+function wrap(v){ return v-Math.round(v/600)*600; }   // keep world coords small (periodic scene)
+function render(pose, opts={}){
+  const pos=[wrap(pose.pos[0]),pose.pos[1],wrap(pose.pos[2])];
+  const rotm=camBasis(pose.yaw,pose.pitch);
+  if(prevCam){ const dx=pos[0]-prevCam.pos[0], dz=pos[2]-prevCam.pos[2]; if(Math.abs(dx)>300||Math.abs(dz)>300) resetTAA=true; }
+  const jit=[halton((S.frame%16)+1,2)-0.5, halton((S.frame%16)+1,3)-0.5]; S.frame++;
+  gl.bindVertexArray(vao);
+  // scene
+  gl.bindFramebuffer(gl.FRAMEBUFFER,sceneFB); gl.viewport(0,0,IW,IH);
+  gl.useProgram(PS.p); const u=PS.u;
+  gl.uniform2f(u.uRes,IW,IH); gl.uniform1f(u.uTime,S.mech); gl.uniform3fv(u.uCamPos,pos);
+  gl.uniformMatrix3fv(u.uCamRot,false,rotm); gl.uniform1f(u.uTanH,TANH); gl.uniform2fv(u.uJitter,jit);
+  gl.uniform1i(u.uPal,S.pal); gl.uniform1i(u.uSteps,opts.steps||200);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  // TAA
+  const nxt=cur^1;
+  gl.bindFramebuffer(gl.FRAMEBUFFER,histFB[nxt]);
+  gl.useProgram(PT.p); const t=PT.u;
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,sceneTex); gl.uniform1i(t.uCur,0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,hist[cur]); gl.uniform1i(t.uHist,1);
+  gl.uniform2f(t.uRes,IW,IH); gl.uniform3fv(t.uCamPos,pos); gl.uniformMatrix3fv(t.uCamRot,false,rotm); gl.uniform1f(t.uTanH,TANH);
+  const pc=prevCam||{pos,rot:rotm};
+  gl.uniform3fv(t.uPrevPos,pc.pos); gl.uniformMatrix3fv(t.uPrevRot,false,pc.rot);
+  gl.uniform1f(t.uReset,resetTAA?1:0); gl.uniform1f(t.uAlpha,opts.alpha||0.11);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,hist[nxt]); gl.generateMipmap(gl.TEXTURE_2D);
+  cur=nxt; resetTAA=false; prevCam={pos,rot:rotm};
+  // post
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,W,H);
+  gl.useProgram(PP.p); gl.uniform1i(PP.u.uTex,0); gl.uniform2f(PP.u.uOut,W,H); gl.uniform1f(PP.u.uTime,S.mech); gl.uniform1f(PP.u.uExposure,1.3);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  return pos;
+}
+
+// ---------- HUD ----------
+const hDep=document.getElementById('hDep'), hRad=document.getElementById('hRad');
+let hudT=0;
+function hud(pos,dt){
+  hudT+=dt; if(hudT<0.1) return; hudT=0;
+  hDep.textContent=(1620-pos[1]).toFixed(1).padStart(6,'0');
+  const fy=((pos[1]+251)%432+432)%432-216, fx=pos[0]-Math.round(pos[0]/200)*200, fz=pos[2]-Math.round(pos[2]/200)*200;
+  const d2=fx*fx+(fy+2.6)*(fy+2.6)+fz*fz;
+  hRad.textContent=((0.035+260/(d2+60))*(0.93+0.07*Math.random())).toFixed(3);
+}
+
+if(CAPTURE){
+  document.getElementById('hud').style.display='none';
+  window.__cap={
+    setup(w,h){ canvas.style.width=w+'px'; canvas.style.height=h+'px'; scale=1; W=H=0; resize(w,h); prevCam=null; S.frame=0; return [IW,IH,hasCBF]; },
+    frame(t,steps){ S.mech=t; S.cruise=t; const p=cruisePose(t); render(p,{steps:steps||200}); gl.finish(); return true; },
+    reset(){ resetTAA=true; prevCam=null; },
+    pixels(){ const px=new Uint8Array(W*H*4); gl.readPixels(0,0,W,H,gl.RGBA,gl.UNSIGNED_BYTE,px);
+      let s=''; const CH=0x8000; for(let i=0;i<px.length;i+=CH) s+=String.fromCharCode.apply(null,px.subarray(i,i+CH)); return btoa(s); },
+    probe(pts){ // returns SDF distance at points (debug: camera clearance)
+      const P=program(HEAD+src('fsCommon')+src('fsProbe')); const n=pts.length;
+      const tx=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,tx); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,n,1,0,gl.RGBA,gl.FLOAT,new Float32Array(pts.flatMap(p=>[p[0],p[1],p[2],p[3]||0])));
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+      const ot=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,ot); gl.texStorage2D(gl.TEXTURE_2D,1,gl.RGBA32F,n,1); const fb=mkFB(ot);
+      gl.viewport(0,0,n,1); gl.useProgram(P.p); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,tx); gl.uniform1i(P.u.uPts,0);
+      const out=[]; const buf=new Float32Array(n*4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER,fb); gl.drawArrays(gl.TRIANGLES,0,3); gl.readPixels(0,0,n,1,gl.RGBA,gl.FLOAT,buf);
+      for(let i=0;i<n;i++) out.push([buf[i*4],buf[i*4+1]]); gl.bindFramebuffer(gl.FRAMEBUFFER,null); return out; },
+    path(t){ return cruisePose(t); }
+  };
+} else {
+  resize();
+  addEventListener('resize',()=>resize());
+  let last=performance.now(), ema=16, adjT=0;
+  function loop(now){
+    const dt=Math.min(0.1,(now-last)/1000); last=now;
+    update(dt);
+    const pose=currentPose();
+    const pos=render(pose);
+    hud(pos,dt);
+    // dynamic resolution: aim for 60 FPS
+    ema=ema*0.92+dt*1000*0.08; adjT+=dt;
+    if(adjT>1.2){ adjT=0;
+      if(ema>18.5&&scale>0.4){ scale=Math.max(0.4,scale*0.86); alloc(); }
+      else if(ema<14.0&&scale<1.0){ scale=Math.min(1.0,scale*1.08); alloc(); } }
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
